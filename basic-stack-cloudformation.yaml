@@ -1,0 +1,254 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Test Stack v2
+
+Parameters:
+#	SSH Key for the EC2 Instance. This is only needed for troubleshooting.
+  SSHKeyName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: SSH Key for the EC2 Instance
+    ConstraintDescription: REQUIRED
+  ClientIPCIDR:
+    Type: String
+    Default: 0.0.0.0/0
+    Description: CIDR IP to be granted access by the SG, use 0.0.0.0/0 to accept all IPs.
+# OS Imaage
+  AmiId:
+    Type: 'AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>'
+    Default: '/aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2'
+    Description: AMI that you want to deploy. Default is the latest version of Amazon Linux2.
+# Route53 ZoneId
+  Route53zoneId:
+    Type: String
+    Description: Route 53 ZoneId for the domain you will associate with the server.
+  DomainName:
+    Type: String
+    Description: Your web address when connecting to Pi-hole
+  EC2InstanceType:
+    Type: String
+    Default: t3.nano
+    Description: The default is the cheapest option. If you are in the 12 month free teir then a t2.micro may be more cost effective.
+# Availability zone for the subnet where the EC2 instance will be created.
+  SubnetAZ:
+    Type: AWS::EC2::AvailabilityZone::Name
+    Description: Availability Zone where everything will be located.
+# Reuse EBS volume or leave blank to create a new one
+  ReuseEBS:
+    Description: Leave empty if you have never run this template before.
+    Type: String
+
+Conditions:
+  ExistingEBS: !Not [!Equals [!Ref ReuseEBS, ""]]
+
+Resources:
+# The VPC where most of the resources are provisioned.
+  myVPC:
+    Type: AWS::EC2::VPC
+    Properties:
+# Only 1 IP address is needed and /28 is the smallest supported size permitted. The first 4 and last addresses are reserved which leaves 11
+      CidrBlock: 172.20.0.0/28
+      Tags:
+      - Key: Name
+        Value: test-vpc
+# Only one subnet is needed so it encompases the entire VPC.
+  MyPublicSubnet:
+    Type: AWS::EC2::Subnet
+    DependsOn: myVPC
+    Properties:
+      VpcId: !Ref myVPC
+      CidrBlock: 172.20.0.0/28
+      Tags:
+      - Key: Name
+        Value: pihole-publicSubnet
+      AvailabilityZone: !Ref SubnetAZ
+# We will need the VPC to have access to the internet.
+  myInternetGateway:
+      Type: "AWS::EC2::InternetGateway"
+      Properties:
+        Tags:
+        - Key: Name
+          Value: test-IGW
+# The VPC route table.
+  myRouteTablePublic:
+      Type: "AWS::EC2::RouteTable"
+      Properties:
+        VpcId: !Ref myVPC
+        Tags:
+          - Key: Name
+            Value: test-myRouteTablePublic
+# Attach the Internet Gateway to myVPC.
+  AttachInternetGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    DependsOn: myInternetGateway
+    Properties:
+      VpcId: !Ref myVPC
+      InternetGatewayId: !Ref myInternetGateway
+# Add a default route to the VPCs internet gateway.
+  RouteDefaultPublic:
+    Type: "AWS::EC2::Route"
+    DependsOn: AttachInternetGateway
+    Properties:
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref myInternetGateway
+      RouteTableId: !Ref myRouteTablePublic
+# Associate the route table to the subnet.
+  MyPublicSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref MyPublicSubnet
+      RouteTableId: !Ref myRouteTablePublic
+# Request a new Elastic IP Address.
+  myEIP:
+    Type: "AWS::EC2::EIP"
+    Properties:
+      Domain: vpc
+# Bind the Elastic IP Address to an Elastic Network Interface.
+  AssociateManagementAccessPort:
+    Type: AWS::EC2::EIPAssociation
+    Properties:
+      AllocationId: !GetAtt myEIP.AllocationId
+      NetworkInterfaceId: !Ref myNetworkInterface
+# Create a security group for the elastic network interface that will be attached to the EC2 instance with port access for OpenVPN, Pi-hole, and SSH.
+  OpenVPNInstanceSG:
+    Type: AWS::EC2::SecurityGroup
+    DependsOn: myVPC
+    Properties:
+      GroupName: pihole-security-group
+      GroupDescription: SG for pihole Server
+      VpcId: !Ref myVPC
+      SecurityGroupIngress:
+        - CidrIp: 0.0.0.0/0
+          Description: Allow all traffic to port 80
+          IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+        - CidrIp: 0.0.0.0/0
+          Description: Allow all traffic to port 443
+          IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+        - CidrIp: 0.0.0.0/0
+          Description: Allow all traffic to port 53/tcp
+          IpProtocol: tcp
+          FromPort: 53
+          ToPort: 53
+        - CidrIp: 0.0.0.0/0
+          Description: Allow all traffic to port 53/udp
+          IpProtocol: udp
+          FromPort: 53
+          ToPort: 53
+        - CidrIp: !Ref ClientIPCIDR
+          Description: OpenVPN Port
+          IpProtocol: udp
+          FromPort: 1194
+          ToPort: 1194
+        - CidrIp: !Ref ClientIPCIDR
+          Description: SSH Port
+          IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+      Tags:
+        -
+          Key: Name
+          Value: test SG
+# The Elastic Network Interface which will be attached to the EC2 instance.
+# The security group, OpenVPNInstanceSG, is also associated with this interface.
+  myNetworkInterface:
+    Type: AWS::EC2::NetworkInterface
+    Properties:
+      SubnetId: !Ref MyPublicSubnet
+      Description: Public Interface
+      GroupSet:
+      - !Ref OpenVPNInstanceSG
+      SourceDestCheck: false
+      Tags:
+        -
+          Key: Name
+          Value: test ENI
+# Bind the domain name to the elastic IP.
+  myDNSRecord:
+    Type: AWS::Route53::RecordSet
+    DependsOn: myEIP
+    Properties:
+      HostedZoneId: !Ref Route53zoneId
+      Comment: DNS name for my instance.
+      Name: !Ref DomainName
+      Type: A
+      TTL: '900'
+      ResourceRecords:
+      - !Ref myEIP
+  myEBSVolume:
+    Type: AWS::EC2::Volume
+    DeletionPolicy: Delete
+    Properties:
+      AvailabilityZone: !Ref SubnetAZ
+      Encrypted: true
+      VolumeType: gp2
+      Size: 10
+      SnapshotId: !If [ExistingEBS, !Ref ReuseEBS, !Ref "AWS::NoValue"]
+      Tags:
+        -
+          Key: Name
+          Value: test_EBS
+# The EC2 instance
+  piholeEC2Instance:
+    Type: "AWS::EC2::Instance"
+    DependsOn:
+      - myEIP
+      - OpenVPNInstanceSG
+    Properties:
+      ImageId: !Ref AmiId
+      InstanceType: !Ref EC2InstanceType
+      Volumes:
+        -
+          VolumeId: !Ref myEBSVolume
+          Device: /dev/sdh
+# Install docker, update software, start docker, run the cfn-init config set, and then send a signal when finished.
+      UserData:
+        "Fn::Base64":
+          !Sub |
+            #!/bin/bash
+            amazon-linux-extras install docker -y
+            yum update -y
+            service docker start
+            sudo curl -L "https://github.com/docker/compose/releases/download/1.23.2/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose
+            sudo chmod +x /usr/local/bin/docker-compose
+            /opt/aws/bin/cfn-init -v --stack ${AWS::StackName} --resource piholeEC2Instance --configsets myCfnConfigSet --region ${AWS::Region}
+            /opt/aws/bin/cfn-signal -e $? --stack ${AWS::StackName} --resource piholeEC2Instance --region ${AWS::Region}
+      SourceDestCheck: false
+      KeyName: !Ref SSHKeyName
+      NetworkInterfaces:
+        -
+          NetworkInterfaceId: !Ref myNetworkInterface
+          DeviceIndex: 0
+      Tags:
+        -
+          Key: Name
+          Value: test-EC2
+# The CloudFormation stack will wait to mark the EC2OpenVPNInstance as CREATE_COMPLETE until we recieve a signal from the instance, or 10 minutes elapses.
+    CreationPolicy:
+      ResourceSignal:
+        Count: "1"
+        Timeout: PT10M
+    Metadata:
+      AWS::CloudFormation::Init:
+# cfn-init config set rules to build the environment.
+# format_volume, generate_CA_key, and generate_client_key are only run if it's a new volume.
+        configSets:
+          myCfnConfigSet:
+            - "mount_volume"
+# Mount EBS Volume and format it if it's a new volume.
+        mount_volume:
+          commands:
+            01_format_mount:
+              command: "mkfs -t ext4 /dev/sdh"
+            02_make_mount_folder:
+              command: "mkdir /mnt/dockershare"
+            03_mount_volume:
+              command: "mount /dev/sdh /mnt/dockershare"
+Outputs:
+  myEIPOut:
+    Description: Instance EIP
+    Value: !Ref myEIP
+  EC2OpenVPNInstanceOut:
+    Description: EC2 Instance
+    Value: !Ref piholeEC2Instance
